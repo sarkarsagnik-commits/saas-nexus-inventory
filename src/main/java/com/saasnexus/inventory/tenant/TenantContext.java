@@ -12,7 +12,8 @@ import java.util.Optional;
  *   <li>It calls {@link #setTenantId(String)} to store the value.</li>
  *   <li>{@link com.saasnexus.inventory.config.TenantAwareDataSource}
  *       reads it via {@link #getTenantId()} and executes
- *       {@code SET LOCAL app.current_tenant = ?} on the JDBC connection.</li>
+ *       {@code set_config('app.current_tenant', ?, true)} on the JDBC
+ *       connection, scoping the tenant to the current transaction.</li>
  *   <li>The filter calls {@link #clear()} in a {@code finally} block
  *       to prevent tenant leakage across requests.</li>
  * </ol>

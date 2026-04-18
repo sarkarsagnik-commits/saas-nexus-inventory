@@ -11,26 +11,38 @@ import java.sql.PreparedStatement;
 import java.sql.SQLException;
 
 /**
- * Wraps the underlying {@link DataSource} to inject the tenant context
- * on every connection checkout via PostgreSQL's {@code set_config()} function.
+ * Wraps the underlying {@link DataSource} to inject
+ * {@code SET LOCAL app.current_tenant} on every connection checkout
+ * via PostgreSQL's {@code set_config()} function.
  *
- * <h3>Why session-scoped (is_local = false)?</h3>
- * <p>Spring's transaction infrastructure calls {@code getConnection()} <b>before</b>
- * starting a transaction ({@code setAutoCommit(false)}). With HikariCP's default
- * {@code autoCommit=true}, a {@code set_config(..., true)} (transaction-local)
- * would run inside an implicit auto-committed single-statement transaction and
- * be <b>immediately discarded</b>. Using session-scope ({@code false}) ensures
- * the tenant setting persists across the entire connection lifecycle.</p>
+ * <h3>Transaction-Scoped Tenant Context (STRICT)</h3>
+ * <p>Uses {@code set_config('app.current_tenant', ?, true)} where
+ * {@code is_local = true} ensures the tenant variable is scoped
+ * <b>strictly to the current transaction</b>. When the transaction
+ * commits or rolls back, PostgreSQL automatically reverts the setting
+ * — making it impossible for a pooled connection to retain a stale
+ * tenant from a previous request.</p>
+ *
+ * <h3>Why this is safe</h3>
+ * <p>HikariCP is configured with {@code auto-commit=false}
+ * (via {@code spring.datasource.hikari.auto-commit=false}). This
+ * guarantees that every connection checked out from the pool is
+ * already inside a transaction block, so {@code is_local = true}
+ * works correctly. Without this setting, the {@code set_config}
+ * call would execute in an auto-committed single-statement
+ * transaction and be silently discarded.</p>
  *
  * <h3>Leak Prevention</h3>
- * <p>This proxy <b>always</b> calls {@code set_config} — setting the tenant to
- * an empty string when no {@link TenantContext} is present. This prevents a
- * pooled connection from retaining a stale tenant from a previous request.</p>
+ * <p>This proxy <b>always</b> calls {@code set_config} — setting
+ * the tenant to an empty string when no {@link TenantContext} is
+ * present. Combined with transaction-local scoping, this provides
+ * defense-in-depth against tenant leakage.</p>
  *
  * <h3>Virtual Thread Safety</h3>
- * <p>Fully compatible with Java 21 Virtual Threads. Each virtual thread gets
- * its own {@link TenantContext} via {@code ThreadLocal}, and each connection
- * checkout sets the tenant independently. No synchronized blocks.</p>
+ * <p>Fully compatible with Java 21 Virtual Threads. Each virtual
+ * thread gets its own {@link TenantContext} via {@code ThreadLocal},
+ * and each connection checkout sets the tenant independently.
+ * No synchronized blocks.</p>
  *
  * @see TenantContext
  * @see DataSourceConfig
@@ -42,14 +54,16 @@ public class TenantAwareDataSource extends DelegatingDataSource {
     /**
      * Uses {@code set_config(setting_name, new_value, is_local)}.
      * <ul>
-     *   <li>{@code is_local = false} → session-scoped (survives past getConnection)</li>
+     *   <li>{@code is_local = true} → transaction-scoped (auto-reverts on COMMIT/ROLLBACK)</li>
      *   <li>We use {@code set_config()} instead of {@code SET LOCAL} because
      *       PostgreSQL does not support parameterized bindings ({@code ?})
      *       in {@code SET} statements.</li>
+     *   <li>Requires {@code spring.datasource.hikari.auto-commit=false}
+     *       so the connection is already in a transaction when this executes.</li>
      * </ul>
      */
     private static final String SET_TENANT_SQL =
-            "SELECT set_config('app.current_tenant', ?, false)";
+            "SELECT set_config('app.current_tenant', ?, true)";
 
     public TenantAwareDataSource(DataSource targetDataSource) {
         super(targetDataSource);
@@ -74,7 +88,8 @@ public class TenantAwareDataSource extends DelegatingDataSource {
      * the real tenant ID or to an empty string. This guarantees:
      * <ol>
      *   <li>RLS sees the correct tenant for authenticated requests.</li>
-     *   <li>Pooled connections never carry a stale tenant from a prior request.</li>
+     *   <li>Transaction-local scoping auto-clears on COMMIT/ROLLBACK.</li>
+     *   <li>Empty-string fallback provides defense-in-depth for no-tenant requests.</li>
      * </ol>
      *
      * <p>Uses a {@link PreparedStatement} with a parameterized query to
@@ -90,7 +105,7 @@ public class TenantAwareDataSource extends DelegatingDataSource {
             ps.execute();
 
             if (log.isDebugEnabled()) {
-                log.debug("Tenant context set on connection: tenant_id={}",
+                log.debug("Tenant context set on connection (transaction-local): tenant_id={}",
                         tenantId.isEmpty() ? "NONE" : tenantId);
             }
         } catch (SQLException e) {
